@@ -1,5 +1,8 @@
 package main
 
+// Copyright (c) 2024 TomatoCo
+// Released under GPL 3.0
+
 import (
 	"bufio"
 	"crypto/aes"
@@ -10,13 +13,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/sha3"
 )
 
-const BUFFER_SIZE = 1024
+const VERSION = "1.0.0"
+
+const BUFFER_SIZE = 4096
 const IV_SIZE = 16
 const KEY_SIZE = 32
 const SECRET_SIZE = 112
@@ -28,9 +34,14 @@ func fatalErr(err error) {
 	}
 }
 
-func generateKeys(password []byte) (pubkey *[KEY_SIZE]byte, privkey *[KEY_SIZE]byte) {
+func generateKeys(password string) (pubkey *[KEY_SIZE]byte, privkey *[KEY_SIZE]byte) {
+
+	// now trim the newline suffix. Once for Linux, again for Windows.
+	password = strings.TrimSuffix(password, "\n")
+	password = strings.TrimSuffix(password, "\r")
+
 	// Argon2id to defend against brute force.
-	seedBytes := argon2.IDKey(password, nil, 1, 64*1024, 4, KEY_SIZE)
+	seedBytes := argon2.IDKey([]byte(password), nil, 1, 64*1024, 4, KEY_SIZE)
 
 	// SHA3 to provide a stream of bytes for key generation.
 	hasher := sha3.NewShake256()
@@ -45,27 +56,34 @@ func generateKeys(password []byte) (pubkey *[KEY_SIZE]byte, privkey *[KEY_SIZE]b
 
 func main() {
 
-	keyfile := flag.String("keyfile", "keyfile", "file to store/read the public key. Requires -generate or -decrypt.")
-	ciphertext := flag.String("decrypt", "ciphertext", "File to decrypt.")
-	plaintext := flag.String("plaintext", "plaintext", "Where to write the plaintext.")
-	generateKey := flag.Bool("generate", false, "generate a public key. Requires -keyfile")
+	keyfile := flag.String("keyfile", "", "File to store/read the public key. Requires -generate or -decrypt.")
+	ciphertext := flag.String("decrypt", "", "File to decrypt.")
+	plaintext := flag.String("plaintext", "", "Where to write the plaintext.")
+	generateKey := flag.Bool("generate", false, "Generate a public key. Requires -keyfile")
+	version := flag.Bool("version", false, "print version ("+VERSION+").")
 
 	flag.Parse()
 
+	if *version {
+		fmt.Println(VERSION)
+		os.Exit(0)
+	}
+
 	// generate key
-	if *generateKey && *keyfile != "keyfile" {
+	if *generateKey && *keyfile != "" {
 		fmt.Println("Enter password:")
 		reader := bufio.NewReader(os.Stdin)
 		text, err := reader.ReadString('\n')
 		fatalErr(err)
 
-		pubkey, _ := generateKeys([]byte(text))
-		os.WriteFile(*keyfile, pubkey[:], 0644)
+		pubkey, _ := generateKeys(text)
+		err = os.WriteFile(*keyfile, pubkey[:], 0644)
+		fatalErr(err)
 		os.Exit(0)
 	}
 
 	// encrypt
-	if !*generateKey && *keyfile != "keyfile" && *ciphertext == "ciphertext" {
+	if !*generateKey && *keyfile != "" {
 		key, err := os.ReadFile(*keyfile)
 		fatalErr(err)
 
@@ -121,22 +139,32 @@ func main() {
 	}
 
 	// decrypt
-	if !*generateKey && *keyfile == "keyfile" && *ciphertext != "ciphertext" && *plaintext != "plaintext" {
+	if !*generateKey && *keyfile == "" && *ciphertext != "" && *plaintext != "" {
 		fmt.Println("Enter password:")
 		reader := bufio.NewReader(os.Stdin)
 		text, err := reader.ReadString('\n')
 		fatalErr(err)
 
 		// Recreate the keys from the password.
-		pubkey, privkey := generateKeys([]byte(text))
+		pubkey, privkey := generateKeys(text)
 
-		encrypted, err := os.ReadFile(*ciphertext)
+		encryptedFile, err := os.OpenFile(*ciphertext, os.O_RDONLY, 0644)
+		fatalErr(err)
+
+		fileStat, err := encryptedFile.Stat()
+		fatalErr(err)
+
+		fileSize := fileStat.Size()
+		payloadSize := fileSize - SECRET_SIZE - HMAC_SIZE
+
+		naclSecret := make([]byte, SECRET_SIZE)
+		_, err = encryptedFile.Read(naclSecret)
 		fatalErr(err)
 
 		// Unbox the randomly generated secrets.
-		result, ok := box.OpenAnonymous(nil, encrypted[:SECRET_SIZE], pubkey, privkey)
+		result, ok := box.OpenAnonymous(nil, naclSecret, pubkey, privkey)
 		if !ok {
-			panic("decryption error")
+			panic("Boxed MAC verification failed. Wrong password or corrupt file.")
 		}
 
 		// Prep the secrets for decryption.
@@ -144,28 +172,63 @@ func main() {
 		hmacKey := result[KEY_SIZE:]
 		iv := [IV_SIZE]byte{}
 
-		// The payload is the data after the random secrets but before the hmac.
-		payload := encrypted[SECRET_SIZE : len(encrypted)-HMAC_SIZE]
-		// The hmac is whatever's left.
-		hmacResult := encrypted[len(encrypted)-HMAC_SIZE:]
+		plaintextBytes := make([]byte, BUFFER_SIZE)
+		ciphertextBytes := make([]byte, BUFFER_SIZE)
 
 		// Pass one. Verify the HMAC.
 		mac := hmac.New(sha256.New, hmacKey)
-		mac.Write(payload)
-		if !hmac.Equal(hmacResult, mac.Sum(nil)) {
-			panic("HMAC verification failed")
+
+		// The payload is the data after the random secrets but before the hmac.
+		payloadRemaining := payloadSize
+		for payloadRemaining > 0 {
+			num, err := encryptedFile.Read(ciphertextBytes[:min(payloadRemaining, BUFFER_SIZE)])
+			payloadRemaining -= int64(num)
+			if num == 0 {
+				break
+			}
+			fatalErr(err)
+			mac.Write(ciphertextBytes[:num])
 		}
 
-		plaintextBytes := make([]byte, len(payload))
+		// The hmac is whatever's left.
+		hmacResult := make([]byte, HMAC_SIZE)
+		_, err = encryptedFile.Read(hmacResult)
+		fatalErr(err)
+
+		if !hmac.Equal(hmacResult, mac.Sum(nil)) {
+			panic("Payload HMAC verification failed. Corrupted file.")
+		}
+
+		f, err := os.Create(*plaintext)
+		fatalErr(err)
+		defer f.Close()
+
+		writer := bufio.NewWriterSize(f, BUFFER_SIZE)
 
 		// Pass two. Decrypt the payload.
+
+		// seek back to the start of the file, skip the NaCL secret from earlier.
+		_, err = encryptedFile.Seek(SECRET_SIZE, 0)
+		fatalErr(err)
+
 		block, err := aes.NewCipher(aesKey)
 		fatalErr(err)
 
 		ctr := cipher.NewCTR(block, iv[:])
-		ctr.XORKeyStream(plaintextBytes, payload)
 
-		os.WriteFile(*plaintext, plaintextBytes, 0644)
+		payloadRemaining = payloadSize
+		for payloadRemaining > 0 {
+			num, err := encryptedFile.Read(ciphertextBytes[:min(payloadRemaining, BUFFER_SIZE)])
+			payloadRemaining -= int64(num)
+			if num == 0 {
+				break
+			}
+			fatalErr(err)
+			ctr.XORKeyStream(plaintextBytes[:num], ciphertextBytes[:num])
+			writer.Write(plaintextBytes[:num])
+		}
+		f.Sync()
+		writer.Flush()
 		os.Exit(0)
 	}
 
